@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 data/samples/
+data/profiles.json
 scripts/demo_conversation.sh
 scripts/demo_conversation_zh.sh
