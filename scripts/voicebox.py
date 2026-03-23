@@ -44,10 +44,34 @@ MODELS = {
         "standard": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
         "high": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
     },
+    "custom_voice": {
+        "standard": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
+        "high": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16",
+    },
     "asr": {
         "standard": "Qwen/Qwen3-ASR-0.6B",
         "high": "Qwen/Qwen3-ASR-1.7B",
     },
+}
+
+CUSTOM_VOICE_SPEAKERS = {
+    "serena": {"lang": "zh", "desc": "Chinese female, warm and expressive"},
+    "vivian": {"lang": "zh", "desc": "Chinese female, clear and professional"},
+    "uncle_fu": {"lang": "zh", "desc": "Chinese male, mature and authoritative"},
+    "dylan": {"lang": "zh", "desc": "Chinese male, young and energetic"},
+    "eric": {"lang": "zh", "desc": "Chinese male, calm and steady"},
+    "ryan": {"lang": "en", "desc": "English male, natural and conversational"},
+    "aiden": {"lang": "en", "desc": "English male, warm and articulate"},
+    "ono_anna": {"lang": "ja", "desc": "Japanese female, soft and expressive"},
+    "sohee": {"lang": "ko", "desc": "Korean female, bright and clear"},
+}
+
+# Default profiles: overall default + per-language CustomVoice defaults
+DEFAULT_PROFILE = "Calm Narrator"
+DEFAULT_CUSTOM_VOICE = {
+    "zh": "Dylan",
+    "en": "Aiden",
+    "ja": "Ono Anna",
 }
 
 QUALITY_HELP = "Quality tier: 'standard' (0.6B, faster, less RAM) or 'high' (1.7B, better quality, ~8GB+ RAM)"
@@ -57,6 +81,8 @@ MODEL_SIZES = {
     "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16": "~3.5GB",
     "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16": "~3.5GB",
     "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16": "~1.5GB",
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16": "~3.5GB",
+    "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16": "~1.5GB",
     "Qwen/Qwen3-ASR-1.7B": "~3.5GB",
     "Qwen/Qwen3-ASR-0.6B": "~1.5GB",
 }
@@ -104,7 +130,11 @@ LANG_MAP = {
 def load_profiles():
     if not PROFILES_FILE.exists():
         return {"profiles": []}
-    return json.loads(PROFILES_FILE.read_text())
+    try:
+        return json.loads(PROFILES_FILE.read_text())
+    except (json.JSONDecodeError, KeyError):
+        click.echo(f"Warning: {PROFILES_FILE} is corrupted. Starting fresh.", err=True)
+        return {"profiles": []}
 
 
 def save_profiles(data):
@@ -115,12 +145,19 @@ def save_profiles(data):
 def find_profile(name):
     data = load_profiles()
     name_lower = name.lower()
+    # 1. Exact match
     for p in data["profiles"]:
         if p["name"].lower() == name_lower:
             return p
+    # 2. Starts-with match
     for p in data["profiles"]:
-        if name_lower in p["name"].lower():
+        if p["name"].lower().startswith(name_lower):
             return p
+    # 3. Contains match (only if query is 3+ chars to avoid false positives)
+    if len(name_lower) >= 3:
+        for p in data["profiles"]:
+            if name_lower in p["name"].lower():
+                return p
     return None
 
 
@@ -170,6 +207,8 @@ def list_profiles():
         kind = p["type"]
         if kind == "designed":
             click.echo(f"  {p['name']}  (designed, {p['language']})  — {p['description'][:60]}...")
+        elif kind == "custom":
+            click.echo(f"  {p['name']}  (custom, speaker={p['speaker']})  — {p.get('description', '')[:60]}")
         else:
             click.echo(f"  {p['name']}  (cloned, {p['language']})  — ref: {p['ref_audio']}")
 
@@ -179,19 +218,25 @@ def list_models():
     """List available models and quality tiers."""
     click.echo("Available models:\n")
     click.echo("Voice Design (create-designed):")
-    click.echo(f"  standard (default): {MODELS['voice_design']['standard']}")
+    click.echo(f"  high (default): {MODELS['voice_design']['standard']}")
     click.echo(f"  (Only 1.7B available — always best quality)\n")
     click.echo("Voice Clone (generate with cloned profiles, create-cloned, record):")
     for q, m in MODELS["voice_clone"].items():
-        default = " (default)" if q == "standard" else ""
+        default = " (default)" if q == "high" else ""
         click.echo(f"  {q}{default}: {m}")
+    click.echo()
+    click.echo("Custom Voice (9 preset premium speakers with style control):")
+    for q, m in MODELS["custom_voice"].items():
+        default = " (default)" if q == "high" else ""
+        click.echo(f"  {q}{default}: {m}")
+    click.echo(f"  Speakers: {', '.join(CUSTOM_VOICE_SPEAKERS.keys())}")
     click.echo()
     click.echo("Speech Recognition / Transcription (record auto-transcribe, transcribe):")
     for q, m in MODELS["asr"].items():
-        default = " (default)" if q == "standard" else ""
+        default = " (default)" if q == "high" else ""
         click.echo(f"  {q}{default}: {m}")
     click.echo()
-    click.echo("Use --quality high on any command to upgrade to 1.7B models.")
+    click.echo("All commands default to --quality high (1.7B). Use --quality standard for faster 0.6B models.")
     click.echo("Note: 'high' models need ~8GB+ RAM and download ~3GB on first use.")
 
 
@@ -295,6 +340,204 @@ def create_cloned(name, audio, ref_text, lang):
     click.echo(f"Profile '{name}' created (cloned).")
 
 
+@cli.command("create-custom")
+@click.argument("name")
+@click.argument("speaker")
+@click.option("--lang", default=None, help="Language code (auto-detected from speaker if omitted)")
+@click.option("--description", "--desc", default=None, help="Optional description for the profile")
+def create_custom(name, speaker, lang, description):
+    """Create a voice profile from a preset CustomVoice speaker.
+
+    Available speakers: serena, vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan
+    """
+    if find_profile(name):
+        click.echo(f"Profile '{name}' already exists.", err=True)
+        sys.exit(1)
+
+    speaker_lower = speaker.lower()
+    if speaker_lower not in CUSTOM_VOICE_SPEAKERS:
+        click.echo(f"Unknown speaker '{speaker}'. Available: {', '.join(CUSTOM_VOICE_SPEAKERS.keys())}", err=True)
+        sys.exit(1)
+
+    speaker_info = CUSTOM_VOICE_SPEAKERS[speaker_lower]
+    if lang is None:
+        lang = speaker_info["lang"]
+    if description is None:
+        description = speaker_info["desc"]
+
+    data = load_profiles()
+    data["profiles"].append({
+        "id": slugify(name),
+        "name": name,
+        "type": "custom",
+        "speaker": speaker_lower,
+        "language": lang,
+        "description": description,
+    })
+    save_profiles(data)
+    click.echo(f"Profile '{name}' created (custom, speaker={speaker_lower}).")
+
+
+@cli.command("speakers")
+def list_speakers():
+    """List available CustomVoice preset speakers."""
+    click.echo("Available CustomVoice speakers:\n")
+    for speaker, info in CUSTOM_VOICE_SPEAKERS.items():
+        click.echo(f"  {speaker:12s}  ({info['lang']})  — {info['desc']}")
+    click.echo(f"\nCreate a profile: voicebox.py create-custom \"Profile Name\" <speaker>")
+
+
+MLX_TTS_PORT = 8765
+MLX_TTS_PID = Path("/tmp/mlx_tts_server.pid")
+MLX_TTS_SERVER = Path(__file__).resolve().parent / "mlx_tts_server.py"
+
+
+def _build_tts_params(profile, text, instruct):
+    """Build TTS params from a voice profile. Returns (params, model_id) or None."""
+    if profile["type"] == "designed":
+        model_id = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16"
+        return {
+            "input_text": text,
+            "instruct": instruct if instruct else profile["description"],
+            "voice": "Chelsie",
+            "model_id": model_id,
+        }, model_id
+    elif profile["type"] == "custom":
+        model_id = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
+        return {
+            "input_text": text,
+            "voice": profile["speaker"],
+            "model_id": model_id,
+        }, model_id
+    return None, None
+
+
+def _call_enconvo(params):
+    """Call EnConvo MLX endpoint. Returns result dict or None."""
+    import urllib.request
+    import json as _json
+    try:
+        urllib.request.urlopen("http://localhost:54535/health", timeout=1)
+    except Exception:
+        return None
+    try:
+        req = urllib.request.Request(
+            "http://localhost:54535/mlx_manage/mlx_audio/tts_generate",
+            data=_json.dumps({"arguments": params}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = _json.loads(resp.read())
+        if isinstance(result, list) or not result.get("audio_path"):
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def _call_standalone(params):
+    """Call standalone MLX TTS server. Returns result dict or None."""
+    import urllib.request
+    import json as _json
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{MLX_TTS_PORT}/tts",
+            data=_json.dumps(params).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = _json.loads(resp.read())
+        if result.get("error") or not result.get("audio_path"):
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def _standalone_running():
+    """Check if standalone MLX TTS server is running."""
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{MLX_TTS_PORT}/health", timeout=1)
+        return True
+    except Exception:
+        return False
+
+
+def _start_standalone():
+    """Start the standalone MLX TTS server in background."""
+    click.echo(f"Starting standalone MLX TTS server on port {MLX_TTS_PORT}...")
+    subprocess.Popen(
+        ["uv", "run", str(MLX_TTS_SERVER)],
+        stdout=open("/tmp/mlx_tts_server.log", "w"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    # Wait for it to be ready
+    import time
+    for _ in range(30):
+        time.sleep(0.5)
+        if _standalone_running():
+            click.echo("MLX TTS server ready.")
+            return True
+    click.echo("MLX TTS server failed to start.", err=True)
+    return False
+
+
+def _kill_standalone():
+    """Kill the standalone MLX TTS server if running."""
+    if MLX_TTS_PID.exists():
+        try:
+            pid = int(MLX_TTS_PID.read_text().strip())
+            os.kill(pid, 15)  # SIGTERM
+            MLX_TTS_PID.unlink(missing_ok=True)
+        except (ValueError, ProcessLookupError, OSError):
+            MLX_TTS_PID.unlink(missing_ok=True)
+
+
+def _try_warm_tts(profile, text, instruct, output, play):
+    """Try generating via warm MLX server (EnConvo or standalone).
+    Returns True if successful, False to fall back to cold Python."""
+    import shutil
+
+    params, model_id = _build_tts_params(profile, text, instruct)
+    if params is None:
+        return False  # Cloned voices not supported via server
+
+    # Priority 1: EnConvo
+    result = _call_enconvo(params)
+    if result:
+        # EnConvo is available — kill standalone if it's running (no need for both)
+        if _standalone_running():
+            click.echo("EnConvo available, shutting down standalone MLX server.")
+            _kill_standalone()
+
+        out_path = f"{output}.wav"
+        shutil.copy2(result["audio_path"], out_path)
+        click.echo(f"Saved: {out_path} ({result.get('duration', 0):.1f}s) [via EnConvo MLX]")
+        if play:
+            click.echo("Playing...")
+            subprocess.run(["afplay", out_path])
+        return True
+
+    # Priority 2: Standalone MLX TTS server
+    if not _standalone_running():
+        if not _start_standalone():
+            return False
+
+    result = _call_standalone(params)
+    if result:
+        out_path = f"{output}.wav"
+        shutil.copy2(result["audio_path"], out_path)
+        click.echo(f"Saved: {out_path} ({result.get('duration', 0):.1f}s) [via standalone MLX]")
+        if play:
+            click.echo("Playing...")
+            subprocess.run(["afplay", out_path])
+        return True
+
+    return False
+
+
 @cli.command("generate")
 @click.argument("profile_name")
 @click.argument("text")
@@ -310,6 +553,12 @@ def generate(profile_name, text, instruct, output, play, quality):
         sys.exit(1)
 
     click.echo(f"Using profile: {profile['name']} ({profile['type']})")
+
+    # Fast path: try warm MLX server (EnConvo → standalone → cold fallback)
+    if _try_warm_tts(profile, text, instruct, output, play):
+        return
+
+    click.echo("No warm MLX server available, using cold mlx_audio...")
 
     import soundfile as sf
 
@@ -335,6 +584,20 @@ def generate(profile_name, text, instruct, output, play, quality):
             ref_audio=ref_audio_path,
             ref_text=profile["ref_text"],
         ))
+
+    elif profile["type"] == "custom":
+        model_id = get_model("custom_voice", quality)
+        model = load_model_with_progress(model_id)
+        language = LANG_MAP.get(profile["language"], "auto")
+        click.echo(f"Generating audio (custom voice, speaker={profile['speaker']})...")
+        kwargs = {
+            "text": text,
+            "speaker": profile["speaker"],
+            "language": language,
+        }
+        if instruct:
+            kwargs["instruct"] = instruct
+        results = list(model.generate_custom_voice(**kwargs))
     else:
         click.echo(f"Unknown profile type: {profile['type']}", err=True)
         sys.exit(1)
@@ -609,6 +872,8 @@ def conversation(script_file, output_dir, gap, quality, do_trim, play):
     def get_or_load_model(profile, qual):
         if profile["type"] == "designed":
             mid = get_model("voice_design", qual)
+        elif profile["type"] == "custom":
+            mid = get_model("custom_voice", qual)
         else:
             mid = get_model("voice_clone", qual)
         if mid not in loaded_models:
@@ -646,6 +911,16 @@ def conversation(script_file, output_dir, gap, quality, do_trim, play):
                 ref_audio=ref_audio_path,
                 ref_text=profile["ref_text"],
             ))
+        elif profile["type"] == "custom":
+            language = LANG_MAP.get(profile["language"], "auto")
+            kwargs = {
+                "text": text,
+                "speaker": profile["speaker"],
+                "language": language,
+            }
+            if instruct:
+                kwargs["instruct"] = instruct
+            results = list(model.generate_custom_voice(**kwargs))
         else:
             click.echo(f"  Error: Unknown profile type '{profile['type']}', skipping.", err=True)
             continue
